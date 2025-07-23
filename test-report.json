@@ -1,0 +1,29 @@
+{
+  "timestamp": "2025-07-22T19:05:24.650Z",
+  "summary": {
+    "sourceTables": 1,
+    "targetTables": 1,
+    "commonTables": 1,
+    "onlyInSource": 0,
+    "onlyInTarget": 0,
+    "differencesFound": 1
+  },
+  "details": {
+    "onlyInSource": [],
+    "onlyInTarget": [],
+    "tableDifferences": [
+      {
+        "tableName": "users",
+        "hasDifferences": true,
+        "columnDifferences": [
+          {
+            "columnName": "created_at",
+            "difference": "Sadece hedef veritabanında bulunuyor"
+          }
+        ],
+        "indexDifferences": [],
+        "constraintDifferences": []
+      }
+    ]
+  }
+}
