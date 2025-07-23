@@ -12,33 +12,124 @@ export class DatabaseComparator {
   }
 
   /**
-   * Test database connection
+   * Create database client with SSL fallback
    */
-  async testConnection(url) {
-    const config = {
+  async createClient(url, options = {}) {
+    // Configurable timeout values with larger defaults for big tables
+    const timeoutMs = options.timeout || 120000; // 2 minutes default
+    const queryTimeoutMs = options.queryTimeout || 300000; // 5 minutes for queries
+    
+    const baseConfig = {
       connectionString: url,
-      connectionTimeoutMillis: 30000, // 30 seconds
-      query_timeout: 30000,
-      statement_timeout: 30000,
-      idle_in_transaction_session_timeout: 30000
+      connectionTimeoutMillis: timeoutMs,
+      query_timeout: queryTimeoutMs,
+      statement_timeout: queryTimeoutMs,
+      idle_in_transaction_session_timeout: timeoutMs
     };
 
-    // Add SSL if required
+    // First try with SSL
+    let config = { ...baseConfig };
     if (url.includes('sslmode=require')) {
+      config.ssl = { rejectUnauthorized: false };
+    } else if (url.includes('sslmode=disable')) {
+      config.ssl = false;
+    } else {
       config.ssl = { rejectUnauthorized: false };
     }
 
-    const client = new Client(config);
+    let client = new Client(config);
+    
+    try {
+      await client.connect();
+      return client;
+    } catch (error) {
+      console.log(chalk.yellow(`SSL connection failed: ${error.message}`));
+      if (client) {
+        await client.end();
+      }
+      
+      // If SSL failed and not explicitly required, try without SSL
+      if (!url.includes('sslmode=require') && !url.includes('sslmode=disable')) {
+        console.log(chalk.yellow('Trying connection without SSL...'));
+        config = { ...baseConfig, ssl: false };
+        client = new Client(config);
+        
+        try {
+          await client.connect();
+          console.log(chalk.green('Non-SSL connection successful'));
+          return client;
+        } catch (error2) {
+          console.error(chalk.red(`Non-SSL connection also failed: ${error2.message}`));
+          if (client) {
+            await client.end();
+          }
+          throw error2;
+        }
+      } else {
+        throw error;
+      }
+    }
+  }
+
+  /**
+   * Test database connection
+   */
+  async testConnection(url, options = {}) {
+    // Configurable timeout values with larger defaults for big tables
+    const timeoutMs = options.timeout || 120000; // 2 minutes default
+    const queryTimeoutMs = options.queryTimeout || 300000; // 5 minutes for queries
+    
+    // First try with SSL
+    let config = {
+      connectionString: url,
+      connectionTimeoutMillis: timeoutMs,
+      query_timeout: queryTimeoutMs,
+      statement_timeout: queryTimeoutMs,
+      idle_in_transaction_session_timeout: timeoutMs
+    };
+
+    // Add SSL configuration
+    if (url.includes('sslmode=require')) {
+      config.ssl = { rejectUnauthorized: false };
+    } else if (url.includes('sslmode=disable')) {
+      // Explicitly disable SSL
+      config.ssl = false;
+    } else {
+      // Default: try SSL first, fallback to non-SSL
+      config.ssl = { rejectUnauthorized: false };
+    }
+
+    let client = new Client(config);
     
     try {
       await client.connect();
       await client.end();
       return true;
     } catch (error) {
-      console.error('Connection error:', error.message);
+      console.error('SSL connection failed:', error.message);
       if (client) {
         await client.end();
       }
+      
+      // If SSL failed and not explicitly required, try without SSL
+      if (!url.includes('sslmode=require') && !url.includes('sslmode=disable')) {
+        console.log('Trying connection without SSL...');
+        config.ssl = false;
+        client = new Client(config);
+        
+        try {
+          await client.connect();
+          await client.end();
+          console.log('Non-SSL connection successful');
+          return true;
+        } catch (error2) {
+          console.error('Non-SSL connection also failed:', error2.message);
+          if (client) {
+            await client.end();
+          }
+        }
+      }
+      
       return false;
     }
   }
@@ -60,21 +151,7 @@ export class DatabaseComparator {
         spinner.succeed('Cloud dump file parsed');
       } else {
         spinner = ora('Connecting to cloud database...').start();
-        
-        const sourceConfig = {
-          connectionString: sourceUrl,
-          connectionTimeoutMillis: 30000,
-          query_timeout: 30000,
-          statement_timeout: 30000,
-          idle_in_transaction_session_timeout: 30000
-        };
-
-        if (sourceUrl.includes('sslmode=require')) {
-          sourceConfig.ssl = { rejectUnauthorized: false };
-        }
-
-        this.sourceClient = new Client(sourceConfig);
-        await this.sourceClient.connect();
+        this.sourceClient = await this.createClient(sourceUrl, dumpOptions);
         spinner.succeed('Cloud database connection successful');
         
         spinner.start('Getting cloud schema information...');
@@ -91,21 +168,7 @@ export class DatabaseComparator {
         spinner.succeed('Edge dump file parsed');
       } else {
         spinner = ora('Connecting to edge database...').start();
-        
-        const targetConfig = {
-          connectionString: targetUrl,
-          connectionTimeoutMillis: 30000,
-          query_timeout: 30000,
-          statement_timeout: 30000,
-          idle_in_transaction_session_timeout: 30000
-        };
-
-        if (targetUrl.includes('sslmode=require')) {
-          targetConfig.ssl = { rejectUnauthorized: false };
-        }
-
-        this.targetClient = new Client(targetConfig);
-        await this.targetClient.connect();
+        this.targetClient = await this.createClient(targetUrl, dumpOptions);
         spinner.succeed('Edge database connection successful');
         
         spinner.start('Getting edge schema information...');
@@ -670,21 +733,7 @@ export class DatabaseComparator {
             results.edge.success++;
           } else {
             // Connect to Edge DB and create table
-            const edgeConfig = {
-              connectionString: edgeUrl,
-              connectionTimeoutMillis: 30000,
-              query_timeout: 30000,
-              statement_timeout: 30000,
-              idle_in_transaction_session_timeout: 30000
-            };
-            
-            if (edgeUrl.includes('sslmode=require')) {
-              edgeConfig.ssl = { rejectUnauthorized: false };
-            }
-            
-            const edgeClient = new Client(edgeConfig);
-            await edgeClient.connect();
-            
+            const edgeClient = await this.createClient(edgeUrl, options);
             await edgeClient.query(query.sql);
             await edgeClient.end();
             
@@ -711,21 +760,7 @@ export class DatabaseComparator {
             results.cloud.success++;
           } else {
             // Connect to Cloud DB and create table
-            const cloudConfig = {
-              connectionString: cloudUrl,
-              connectionTimeoutMillis: 30000,
-              query_timeout: 30000,
-              statement_timeout: 30000,
-              idle_in_transaction_session_timeout: 30000
-            };
-            
-            if (cloudUrl.includes('sslmode=require')) {
-              cloudConfig.ssl = { rejectUnauthorized: false };
-            }
-            
-            const cloudClient = new Client(cloudConfig);
-            await cloudClient.connect();
-            
+            const cloudClient = await this.createClient(cloudUrl, options);
             await cloudClient.query(query.sql);
             await cloudClient.end();
             

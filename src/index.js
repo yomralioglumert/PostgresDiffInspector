@@ -25,11 +25,14 @@ program
   .option('-e, --edge <url>', 'Edge database connection URL', process.env.EDGE_DB_URL)
   .option('--cloud-dump <file>', 'Cloud database dump file')
   .option('--edge-dump <file>', 'Edge database dump file')
-  .option('-s, --schema <name>', 'Schema name to compare', process.env.DEFAULT_SCHEMA || 'public')
+  .option('-s, --schema <n>', 'Schema name to compare', process.env.DEFAULT_SCHEMA || 'public')
   .option('-o, --output <file>', 'Output file (optional)')
   .option('-v, --verbose', 'Verbose output')
   .option('--execute', 'Automatically create missing tables')
   .option('--dry-run', 'Preview SQL execution without running')
+  .option('--timeout <ms>', 'Connection timeout in milliseconds (default: 120000)', parseInt)
+  .option('--query-timeout <ms>', 'Query timeout in milliseconds (default: 300000)', parseInt)
+  .option('--batch-size <n>', 'Batch size for large table processing (default: 10000)', parseInt)
   .action(async (options) => {
     try {
       // Parameter validation
@@ -51,6 +54,12 @@ program
       console.log(chalk.blue.bold('🔍 Postgres Diff Inspector (PDI) - Schema Comparison'));
       console.log(chalk.gray('='.repeat(50)));
       
+      // Timeout configuration
+      const timeoutOptions = {};
+      if (options.timeout) timeoutOptions.timeout = options.timeout;
+      if (options.queryTimeout) timeoutOptions.queryTimeout = options.queryTimeout;
+      if (options.batchSize) timeoutOptions.batchSize = options.batchSize;
+      
       const comparator = new DatabaseComparator();
       
       console.log(chalk.yellow('📊 Starting comparison...'));
@@ -59,6 +68,9 @@ program
       if (hasEdgeUrl) console.log(chalk.gray(`Edge DB: ${options.edge}`));
       if (hasEdgeDump) console.log(chalk.gray(`Edge Dump: ${options.edgeDump}`));
       console.log(chalk.gray(`Schema: ${options.schema}`));
+      if (Object.keys(timeoutOptions).length > 0) {
+        console.log(chalk.gray(`Timeout Config: ${JSON.stringify(timeoutOptions)}`));
+      }
       if (options.execute) {
         console.log(chalk.red('⚠️  AUTOMATIC TABLE CREATION MODE ACTIVE!'));
       }
@@ -74,7 +86,8 @@ program
         options.verbose,
         {
           cloudDump: options.cloudDump,
-          edgeDump: options.edgeDump
+          edgeDump: options.edgeDump,
+          ...timeoutOptions
         }
       );
       
@@ -151,13 +164,24 @@ program
   .command('health')
   .description('Test database connection health')
   .requiredOption('-u, --url <url>', 'Database connection URL')
+  .option('--timeout <ms>', 'Connection timeout in milliseconds (default: 120000)', parseInt)
+  .option('--query-timeout <ms>', 'Query timeout in milliseconds (default: 300000)', parseInt)
   .action(async (options) => {
     try {
       console.log(chalk.blue.bold('🔌 Connection Test'));
       console.log(chalk.gray('='.repeat(30)));
       
+      // Timeout configuration
+      const timeoutOptions = {};
+      if (options.timeout) timeoutOptions.timeout = options.timeout;
+      if (options.queryTimeout) timeoutOptions.queryTimeout = options.queryTimeout;
+      
+      if (Object.keys(timeoutOptions).length > 0) {
+        console.log(chalk.gray(`Timeout Config: ${JSON.stringify(timeoutOptions)}`));
+      }
+      
       const comparator = new DatabaseComparator();
-      const isConnected = await comparator.testConnection(options.url);
+      const isConnected = await comparator.testConnection(options.url, timeoutOptions);
       
       if (isConnected) {
         console.log(chalk.green('✅ Connection successful!'));
@@ -179,11 +203,14 @@ program
   .option('-e, --edge <url>', 'Edge database connection URL', process.env.EDGE_DB_URL)
   .option('--cloud-dump <file>', 'Cloud database dump file')
   .option('--edge-dump <file>', 'Edge database dump file')
-  .option('-s, --schema <name>', 'Schema name to compare', process.env.DEFAULT_SCHEMA || 'public')
+  .option('-s, --schema <n>', 'Schema name to compare', process.env.DEFAULT_SCHEMA || 'public')
   .option('-o, --output <file>', 'SQL output file (optional)')
   .option('-v, --verbose', 'Verbose output')
   .option('--execute', 'Automatically insert missing records')
   .option('--dry-run', 'Preview SQL execution without running')
+  .option('--timeout <ms>', 'Connection timeout in milliseconds (default: 120000)', parseInt)
+  .option('--query-timeout <ms>', 'Query timeout in milliseconds (default: 300000)', parseInt)
+  .option('--batch-size <n>', 'Batch size for large table processing (default: 10000)', parseInt)
   .action(async (options) => {
     try {
       // Parameter validation
@@ -205,6 +232,12 @@ program
       console.log(chalk.blue.bold('🔍 Postgres Diff Inspector (PDI) - Data Comparison'));
       console.log(chalk.gray('='.repeat(50)));
       
+      // Timeout configuration
+      const timeoutOptions = {};
+      if (options.timeout) timeoutOptions.timeout = options.timeout;
+      if (options.queryTimeout) timeoutOptions.queryTimeout = options.queryTimeout;
+      if (options.batchSize) timeoutOptions.batchSize = options.batchSize;
+      
       const dataComparator = new DataComparator();
       
       console.log(chalk.yellow('📊 Starting data comparison...'));
@@ -213,6 +246,9 @@ program
       if (hasEdgeUrl) console.log(chalk.gray(`Edge DB: ${options.edge}`));
       if (hasEdgeDump) console.log(chalk.gray(`Edge Dump: ${options.edgeDump}`));
       console.log(chalk.gray(`Schema: ${options.schema}`));
+      if (Object.keys(timeoutOptions).length > 0) {
+        console.log(chalk.gray(`Timeout Config: ${JSON.stringify(timeoutOptions)}`));
+      }
       if (options.execute) {
         console.log(chalk.red('⚠️  AUTOMATIC RECORD INSERTION MODE ACTIVE!'));
       }
@@ -228,7 +264,8 @@ program
         { 
           verbose: options.verbose,
           cloudDump: options.cloudDump,
-          edgeDump: options.edgeDump
+          edgeDump: options.edgeDump,
+          ...timeoutOptions
         }
       );
       

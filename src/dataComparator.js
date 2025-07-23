@@ -11,6 +11,66 @@ export class DataComparator {
   }
 
   /**
+   * Create database client with SSL fallback
+   */
+  async createClient(url, options = {}) {
+    // Configurable timeout values with larger defaults for big tables
+    const timeoutMs = options.timeout || 120000; // 2 minutes default
+    const queryTimeoutMs = options.queryTimeout || 300000; // 5 minutes for queries
+    
+    const baseConfig = {
+      connectionString: url,
+      connectionTimeoutMillis: timeoutMs,
+      query_timeout: queryTimeoutMs,
+      statement_timeout: queryTimeoutMs,
+      idle_in_transaction_session_timeout: timeoutMs
+    };
+
+    // First try with SSL
+    let config = { ...baseConfig };
+    if (url.includes('sslmode=require')) {
+      config.ssl = { rejectUnauthorized: false };
+    } else if (url.includes('sslmode=disable')) {
+      config.ssl = false;
+    } else {
+      config.ssl = { rejectUnauthorized: false };
+    }
+
+    let client = new Client(config);
+    
+    try {
+      await client.connect();
+      return client;
+    } catch (error) {
+      console.log(chalk.yellow(`SSL connection failed: ${error.message}`));
+      if (client) {
+        await client.end();
+      }
+      
+      // If SSL failed and not explicitly required, try without SSL
+      if (!url.includes('sslmode=require') && !url.includes('sslmode=disable')) {
+        console.log(chalk.yellow('Trying connection without SSL...'));
+        config = { ...baseConfig, ssl: false };
+        client = new Client(config);
+        
+        try {
+          await client.connect();
+          console.log(chalk.green('Non-SSL connection successful'));
+          return client;
+        } catch (error2) {
+          console.error(chalk.red(`Non-SSL connection also failed: ${error2.message}`));
+          if (client) {
+            await client.end();
+          }
+          throw error2;
+        }
+      } else {
+        throw error;
+      }
+    }
+  }
+
+  /**
    * İki veritabanı arasında veri karşılaştırması yapar
    */
   async compareData(cloudUrl, edgeUrl, schema = 'public', options = {}) {
@@ -28,21 +88,7 @@ export class DataComparator {
         spinner.succeed('Cloud dump dosyası parse edildi');
       } else {
         spinner = ora('Cloud veritabanına bağlanılıyor...').start();
-        
-        const cloudConfig = {
-          connectionString: cloudUrl,
-          connectionTimeoutMillis: 30000,
-          query_timeout: 30000,
-          statement_timeout: 30000,
-          idle_in_transaction_session_timeout: 30000
-        };
-
-        if (cloudUrl.includes('sslmode=require')) {
-          cloudConfig.ssl = { rejectUnauthorized: false };
-        }
-
-        this.cloudClient = new Client(cloudConfig);
-        await this.cloudClient.connect();
+        this.cloudClient = await this.createClient(cloudUrl, options);
         spinner.succeed('Cloud veritabanına bağlantı başarılı');
       }
 
@@ -55,21 +101,7 @@ export class DataComparator {
         spinner.succeed('Edge dump dosyası parse edildi');
       } else {
         spinner = ora('Edge veritabanına bağlanılıyor...').start();
-        
-        const edgeConfig = {
-          connectionString: edgeUrl,
-          connectionTimeoutMillis: 30000,
-          query_timeout: 30000,
-          statement_timeout: 30000,
-          idle_in_transaction_session_timeout: 30000
-        };
-
-        if (edgeUrl.includes('sslmode=require')) {
-          edgeConfig.ssl = { rejectUnauthorized: false };
-        }
-
-        this.edgeClient = new Client(edgeConfig);
-        await this.edgeClient.connect();
+        this.edgeClient = await this.createClient(edgeUrl, options);
         spinner.succeed('Edge veritabanına bağlantı başarılı');
       }
       
@@ -206,9 +238,8 @@ export class DataComparator {
       if (options.cloudDump && cloudData) {
         cloudRows = cloudData[tableName]?.records || [];
       } else {
-        const cloudQuery = `SELECT * FROM "${schema}"."${tableName}" ORDER BY ${pkColumns.map(col => `"${col}"`).join(', ')}`;
-        const cloudResult = await this.cloudClient.query(cloudQuery);
-        cloudRows = cloudResult.rows;
+        // Büyük tablolar için sayfalama kullan
+        cloudRows = await this.getTableDataWithPagination(this.cloudClient, tableName, schema, pkColumns, options);
       }
       result.totalCloudRecords = cloudRows.length;
 
@@ -216,9 +247,8 @@ export class DataComparator {
       if (options.edgeDump && edgeData) {
         edgeRows = edgeData[tableName]?.records || [];
       } else {
-        const edgeQuery = `SELECT * FROM "${schema}"."${tableName}" ORDER BY ${pkColumns.map(col => `"${col}"`).join(', ')}`;
-        const edgeResult = await this.edgeClient.query(edgeQuery);
-        edgeRows = edgeResult.rows;
+        // Büyük tablolar için sayfalama kullan
+        edgeRows = await this.getTableDataWithPagination(this.edgeClient, tableName, schema, pkColumns, options);
       }
       result.totalEdgeRecords = edgeRows.length;
 
@@ -256,9 +286,80 @@ export class DataComparator {
 
     } catch (error) {
       console.log(chalk.red(`❌ ${tableName} tablosu karşılaştırılırken hata: ${error.message}`));
+      
+      // Timeout hatası özel durumu
+      if (error.message.includes('timeout') || error.message.includes('Query read timeout')) {
+        console.log(chalk.yellow(`💡 ${tableName} tablosu çok büyük olabilir. Sayfalama kullanarak tekrar deneniyor...`));
+        try {
+          // Daha küçük batch boyutu ile tekrar dene
+          const retryOptions = { ...options, batchSize: Math.max(1000, (options.batchSize || 10000) / 2) };
+          return await this.compareTableData(tableName, schema, retryOptions, cloudData, edgeData);
+        } catch (retryError) {
+          console.log(chalk.red(`❌ ${tableName} tablosu tekrar denemede de başarısız: ${retryError.message}`));
+        }
+      }
     }
 
     return result;
+  }
+
+  /**
+   * Büyük tablolar için sayfalama ile veri alma
+   */
+  async getTableDataWithPagination(client, tableName, schema, pkColumns, options = {}) {
+    const batchSize = options.batchSize || 10000; // Varsayılan 10k kayıt
+    const maxRetries = options.maxRetries || 3;
+    let allRows = [];
+    let offset = 0;
+    let hasMoreData = true;
+    
+    console.log(chalk.cyan(`📄 ${tableName} tablosu sayfalama ile alınıyor (batch: ${batchSize})...`));
+    
+    while (hasMoreData) {
+      let retryCount = 0;
+      let batchData = null;
+      
+      while (retryCount < maxRetries) {
+        try {
+          const query = `
+            SELECT * FROM "${schema}"."${tableName}" 
+            ORDER BY ${pkColumns.map(col => `"${col}"`).join(', ')}
+            LIMIT ${batchSize} OFFSET ${offset}
+          `;
+          
+          const result = await client.query(query);
+          batchData = result.rows;
+          break;
+          
+        } catch (error) {
+          retryCount++;
+          console.log(chalk.yellow(`⚠️  ${tableName} batch ${offset}-${offset + batchSize} hata (deneme ${retryCount}/${maxRetries}): ${error.message}`));
+          
+          if (retryCount >= maxRetries) {
+            throw new Error(`${tableName} tablosu ${maxRetries} denemede başarısız: ${error.message}`);
+          }
+          
+          // Exponential backoff
+          await new Promise(resolve => setTimeout(resolve, Math.pow(2, retryCount) * 1000));
+        }
+      }
+      
+      if (batchData && batchData.length > 0) {
+        allRows.push(...batchData);
+        offset += batchSize;
+        hasMoreData = batchData.length === batchSize;
+        
+        // İlerleme göster
+        if (offset % (batchSize * 5) === 0) {
+          console.log(chalk.gray(`  📊 ${tableName}: ${allRows.length} kayıt alındı...`));
+        }
+      } else {
+        hasMoreData = false;
+      }
+    }
+    
+    console.log(chalk.green(`✅ ${tableName}: Toplam ${allRows.length} kayıt alındı`));
+    return allRows;
   }
 
   /**
@@ -531,20 +632,6 @@ export class DataComparator {
    * INSERT SQL'lerini hedef veritabanına uygular
    */
   async executeInsertQueries(insertQueries, targetUrl, options = {}) {
-    const config = {
-      connectionString: targetUrl,
-      connectionTimeoutMillis: 30000,
-      query_timeout: 30000,
-      statement_timeout: 30000,
-      idle_in_transaction_session_timeout: 30000
-    };
-
-    // SSL gerekiyorsa ekle
-    if (targetUrl.includes('sslmode=require')) {
-      config.ssl = { rejectUnauthorized: false };
-    }
-
-    const client = new Client(config);
     const results = {
       success: 0,
       failed: 0,
@@ -552,7 +639,7 @@ export class DataComparator {
     };
 
     try {
-      await client.connect();
+      const client = await this.createClient(targetUrl, options);
       
       if (options.dryRun) {
         console.log(chalk.yellow('🔍 DRY RUN MODE - SQL\'ler çalıştırılmayacak'));
