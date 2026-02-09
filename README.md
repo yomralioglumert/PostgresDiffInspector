@@ -1,4 +1,4 @@
-# Postgres Diff Inspector (PDI)
+****# Postgres Diff Inspector (PDI)
 
 A powerful CLI tool for schema and data comparison between PostgreSQL databases.
 

@@ -17,7 +17,7 @@ export class DataComparator {
     // Configurable timeout values with larger defaults for big tables
     const timeoutMs = options.timeout || 120000; // 2 minutes default
     const queryTimeoutMs = options.queryTimeout || 300000; // 5 minutes for queries
-    
+
     const baseConfig = {
       connectionString: url,
       connectionTimeoutMillis: timeoutMs,
@@ -37,7 +37,7 @@ export class DataComparator {
     }
 
     let client = new Client(config);
-    
+
     try {
       await client.connect();
       return client;
@@ -46,13 +46,13 @@ export class DataComparator {
       if (client) {
         await client.end();
       }
-      
+
       // If SSL failed and not explicitly required, try without SSL
       if (!url.includes('sslmode=require') && !url.includes('sslmode=disable')) {
         console.log(chalk.yellow('Trying connection without SSL...'));
         config = { ...baseConfig, ssl: false };
         client = new Client(config);
-        
+
         try {
           await client.connect();
           console.log(chalk.green('Non-SSL connection successful'));
@@ -77,7 +77,24 @@ export class DataComparator {
     let spinner;
     let cloudData, edgeData;
     let commonTables = [];
-    
+
+    // Parse table filter - supports both "table" and "schema.table" formats
+    let tableFilter = null;
+    if (options.tables && options.tables.length > 0) {
+      tableFilter = options.tables.map(t => {
+        if (t.includes('.')) {
+          const [tableSchema, tableName] = t.split('.');
+          // If schema matches, use just the table name
+          if (tableSchema === schema) {
+            return tableName;
+          }
+          // If different schema, we'll skip this table for this schema
+          return null;
+        }
+        return t;
+      }).filter(t => t !== null);
+    }
+
     try {
       // Cloud kaynağını belirle (DB veya dump)
       if (options.cloudDump) {
@@ -104,7 +121,7 @@ export class DataComparator {
         this.edgeClient = await this.createClient(edgeUrl, options);
         spinner.succeed('Edge veritabanına bağlantı başarılı');
       }
-      
+
       // Ortak tabloları bul
       spinner.start('Ortak tablolar bulunuyor...');
       if (options.cloudDump && options.edgeDump) {
@@ -114,10 +131,16 @@ export class DataComparator {
         commonTables = cloudTables.filter(table => edgeTables.includes(table));
       } else {
         // En az bir taraf DB ise, mevcut metodu kullan
-        commonTables = await this.getCommonTables(schema);
+        commonTables = await this.getCommonTables(schema, tableFilter);
       }
+
+      // Apply table filter if provided (for dump sources)
+      if (tableFilter && tableFilter.length > 0) {
+        commonTables = commonTables.filter(table => tableFilter.includes(table));
+      }
+
       spinner.succeed(`${commonTables.length} ortak tablo bulundu`);
-      
+
       const results = {
         summary: {
           totalTables: commonTables.length,
@@ -132,7 +155,7 @@ export class DataComparator {
       // Her tablo için veri karşılaştırması yap
       for (const tableName of commonTables) {
         spinner.start(`${tableName} tablosu karşılaştırılıyor...`);
-        
+
         let tableResult;
         if (options.cloudDump && options.edgeDump) {
           // Her iki taraf da dump ise, dump verilerini karşılaştır
@@ -142,21 +165,21 @@ export class DataComparator {
           tableResult = await this.compareTableData(tableName, schema, options, cloudData, edgeData);
         }
         results.tableResults.push(tableResult);
-        
+
         if (tableResult.hasDifferences) {
           results.summary.tablesWithDifferences++;
           results.summary.totalMissingRecords += tableResult.missingInEdge.length + tableResult.missingInCloud.length;
-          
+
           // INSERT SQL'leri oluştur
           const insertQueries = this.generateInsertQueries(tableName, tableResult);
           results.insertQueries.push(...insertQueries);
         }
-        
+
         spinner.succeed(`${tableName} tablosu tamamlandı`);
       }
 
       return results;
-      
+
     } catch (error) {
       spinner.fail('Hata oluştu');
       throw error;
@@ -173,22 +196,41 @@ export class DataComparator {
 
   /**
    * Ortak tabloları bulur
+   * @param {string} schema - Schema name
+   * @param {string[]|null} tables - Optional array of specific tables to filter
    */
-  async getCommonTables(schema) {
-    const sourceTablesQuery = `
-      SELECT table_name 
-      FROM information_schema.tables 
-      WHERE table_schema = $1 
-      AND table_type = 'BASE TABLE'
-      ORDER BY table_name
-    `;
-    
-    const cloudResult = await this.cloudClient.query(sourceTablesQuery, [schema]);
-    const edgeResult = await this.edgeClient.query(sourceTablesQuery, [schema]);
-    
+  async getCommonTables(schema, tables = null) {
+    let sourceTablesQuery;
+    let queryParams;
+
+    if (tables && tables.length > 0) {
+      const placeholders = tables.map((_, i) => `$${i + 2}`).join(', ');
+      sourceTablesQuery = `
+        SELECT table_name 
+        FROM information_schema.tables 
+        WHERE table_schema = $1 
+        AND table_type = 'BASE TABLE'
+        AND table_name IN (${placeholders})
+        ORDER BY table_name
+      `;
+      queryParams = [schema, ...tables];
+    } else {
+      sourceTablesQuery = `
+        SELECT table_name 
+        FROM information_schema.tables 
+        WHERE table_schema = $1 
+        AND table_type = 'BASE TABLE'
+        ORDER BY table_name
+      `;
+      queryParams = [schema];
+    }
+
+    const cloudResult = await this.cloudClient.query(sourceTablesQuery, queryParams);
+    const edgeResult = await this.edgeClient.query(sourceTablesQuery, queryParams);
+
     const cloudTables = new Set(cloudResult.rows.map(row => row.table_name));
     const edgeTables = new Set(edgeResult.rows.map(row => row.table_name));
-    
+
     return Array.from(cloudTables).filter(table => edgeTables.has(table));
   }
 
@@ -208,7 +250,7 @@ export class DataComparator {
     try {
       // Primary key'leri bul
       let pkColumns = [];
-      
+
       if (this.cloudClient) {
         // DB bağlantısı varsa information_schema'dan al
         pkColumns = await this.getPrimaryKeyColumns(tableName, schema);
@@ -221,7 +263,7 @@ export class DataComparator {
           pkColumns = Object.keys(sampleData);
         }
       }
-      
+
       if (pkColumns.length === 0) {
         console.log(chalk.yellow(`⚠️  ${tableName} tablosunda primary key bulunamadı, atlanıyor`));
         return result;
@@ -231,9 +273,9 @@ export class DataComparator {
       if (this.cloudClient) {
         const allColumns = await this.getTableColumns(tableName, schema);
       }
-      
+
       let cloudRows, edgeRows;
-      
+
       // Cloud verilerini al (DB veya dump)
       if (options.cloudDump && cloudData) {
         cloudRows = cloudData[tableName]?.records || [];
@@ -286,7 +328,7 @@ export class DataComparator {
 
     } catch (error) {
       console.log(chalk.red(`❌ ${tableName} tablosu karşılaştırılırken hata: ${error.message}`));
-      
+
       // Timeout hatası özel durumu
       if (error.message.includes('timeout') || error.message.includes('Query read timeout')) {
         console.log(chalk.yellow(`💡 ${tableName} tablosu çok büyük olabilir. Sayfalama kullanarak tekrar deneniyor...`));
@@ -312,13 +354,13 @@ export class DataComparator {
     let allRows = [];
     let offset = 0;
     let hasMoreData = true;
-    
+
     console.log(chalk.cyan(`📄 ${tableName} tablosu sayfalama ile alınıyor (batch: ${batchSize})...`));
-    
+
     while (hasMoreData) {
       let retryCount = 0;
       let batchData = null;
-      
+
       while (retryCount < maxRetries) {
         try {
           const query = `
@@ -326,29 +368,29 @@ export class DataComparator {
             ORDER BY ${pkColumns.map(col => `"${col}"`).join(', ')}
             LIMIT ${batchSize} OFFSET ${offset}
           `;
-          
+
           const result = await client.query(query);
           batchData = result.rows;
           break;
-          
+
         } catch (error) {
           retryCount++;
           console.log(chalk.yellow(`⚠️  ${tableName} batch ${offset}-${offset + batchSize} hata (deneme ${retryCount}/${maxRetries}): ${error.message}`));
-          
+
           if (retryCount >= maxRetries) {
             throw new Error(`${tableName} tablosu ${maxRetries} denemede başarısız: ${error.message}`);
           }
-          
+
           // Exponential backoff
           await new Promise(resolve => setTimeout(resolve, Math.pow(2, retryCount) * 1000));
         }
       }
-      
+
       if (batchData && batchData.length > 0) {
         allRows.push(...batchData);
         offset += batchSize;
         hasMoreData = batchData.length === batchSize;
-        
+
         // İlerleme göster
         if (offset % (batchSize * 5) === 0) {
           console.log(chalk.gray(`  📊 ${tableName}: ${allRows.length} kayıt alındı...`));
@@ -357,7 +399,7 @@ export class DataComparator {
         hasMoreData = false;
       }
     }
-    
+
     console.log(chalk.green(`✅ ${tableName}: Toplam ${allRows.length} kayıt alındı`));
     return allRows;
   }
@@ -379,7 +421,7 @@ export class DataComparator {
       // Dump verilerinden kayıtları al
       const cloudRecords = cloudData[tableName]?.records || [];
       const edgeRecords = edgeData[tableName]?.records || [];
-      
+
       result.totalCloudRecords = cloudRecords.length;
       result.totalEdgeRecords = edgeRecords.length;
 
@@ -461,7 +503,7 @@ export class DataComparator {
       AND tc.table_name = $2
       ORDER BY kcu.ordinal_position
     `;
-    
+
     const result = await this.cloudClient.query(query, [schema, tableName]);
     return result.rows.map(row => row.column_name);
   }
@@ -477,7 +519,7 @@ export class DataComparator {
       AND table_name = $2
       ORDER BY ordinal_position
     `;
-    
+
     const result = await this.cloudClient.query(query, [schema, tableName]);
     return result.rows;
   }
@@ -496,7 +538,7 @@ export class DataComparator {
    */
   generateInsertQueries(tableName, tableResult) {
     const queries = [];
-    
+
     // Cloud'da olup Edge'de olmayan kayıtlar için INSERT (Edge'e eklenecek)
     if (tableResult.missingInEdge.length > 0) {
       const columns = Object.keys(tableResult.missingInEdge[0]);
@@ -504,7 +546,7 @@ export class DataComparator {
         const values = columns.map(col => this.formatValue(record[col]));
         return `(${values.join(', ')})`;
       });
-      
+
       const insertQuery = `INSERT INTO "${tableName}" (${columns.map(col => `"${col}"`).join(', ')}) VALUES ${valuesList.join(', ')};`;
       queries.push({
         type: 'INSERT_TO_EDGE',
@@ -522,7 +564,7 @@ export class DataComparator {
         const values = columns.map(col => this.formatValue(record[col]));
         return `(${values.join(', ')})`;
       });
-      
+
       const insertQuery = `INSERT INTO "${tableName}" (${columns.map(col => `"${col}"`).join(', ')}) VALUES ${valuesList.join(', ')};`;
       queries.push({
         type: 'INSERT_TO_CLOUD',
@@ -543,30 +585,30 @@ export class DataComparator {
     if (value === null || value === undefined) {
       return 'NULL';
     }
-    
+
     if (typeof value === 'string') {
       return `'${value.replace(/'/g, "''")}'`;
     }
-    
+
     if (typeof value === 'boolean') {
       return value ? 'TRUE' : 'FALSE';
     }
-    
+
     if (value instanceof Date) {
       return `'${value.toISOString()}'`;
     }
-    
+
     // PostgreSQL özel veri tipleri için formatla
     if (typeof value === 'object' && value !== null) {
       // Boş obje ise NULL döndür
       if (Object.keys(value).length === 0) {
         return 'NULL';
       }
-      
+
       // PostgreSQL interval objesi ise (örn: {hours: 5, minutes: 30})
-      if (value.years !== undefined || value.months !== undefined || value.days !== undefined || 
-          value.hours !== undefined || value.minutes !== undefined || value.seconds !== undefined) {
-        
+      if (value.years !== undefined || value.months !== undefined || value.days !== undefined ||
+        value.hours !== undefined || value.minutes !== undefined || value.seconds !== undefined) {
+
         const parts = [];
         if (value.years) parts.push(`${value.years} years`);
         if (value.months) parts.push(`${value.months} months`);
@@ -574,20 +616,20 @@ export class DataComparator {
         if (value.hours) parts.push(`${value.hours} hours`);
         if (value.minutes) parts.push(`${value.minutes} minutes`);
         if (value.seconds) parts.push(`${value.seconds} seconds`);
-        
+
         if (parts.length === 0) return 'NULL';
         return `'${parts.join(' ')}'::interval`;
       }
-      
+
       // Diğer objeler için JSON formatla
       return `'${JSON.stringify(value).replace(/'/g, "''")}'`;
     }
-    
+
     // Array ise JSON olarak formatla
     if (Array.isArray(value)) {
       return `'${JSON.stringify(value).replace(/'/g, "''")}'`;
     }
-    
+
     return String(value);
   }
 
@@ -640,7 +682,7 @@ export class DataComparator {
 
     try {
       const client = await this.createClient(targetUrl, options);
-      
+
       if (options.dryRun) {
         console.log(chalk.yellow('🔍 DRY RUN MODE - SQL\'ler çalıştırılmayacak'));
         return results;
@@ -694,17 +736,17 @@ export class DataComparator {
    */
   async generateOrganizedOutput(insertQueries, baseOutputPath = process.env.OUTPUT_DIR || 'output') {
     const fs = await import('fs/promises');
-    
+
     // Ana klasörleri oluştur
     await fs.mkdir(`${baseOutputPath}/cloud-to-edge`, { recursive: true });
     await fs.mkdir(`${baseOutputPath}/edge-to-cloud`, { recursive: true });
-    
+
     // Cloud'dan Edge'e SQL'leri
     const cloudToEdgeQueries = insertQueries.filter(q => q.type === 'INSERT_TO_EDGE');
     if (cloudToEdgeQueries.length > 0) {
       const sqlContent = this.generateSqlFile(cloudToEdgeQueries, 'cloud-to-edge.sql');
       await fs.writeFile(`${baseOutputPath}/cloud-to-edge/missing-records.sql`, sqlContent, 'utf8');
-      
+
       // JSON raporu da oluştur
       const jsonReport = {
         timestamp: new Date().toISOString(),
@@ -719,13 +761,13 @@ export class DataComparator {
       };
       await fs.writeFile(`${baseOutputPath}/cloud-to-edge/report.json`, JSON.stringify(jsonReport, null, 2), 'utf8');
     }
-    
+
     // Edge'den Cloud'a SQL'leri
     const edgeToCloudQueries = insertQueries.filter(q => q.type === 'INSERT_TO_CLOUD');
     if (edgeToCloudQueries.length > 0) {
       const sqlContent = this.generateSqlFile(edgeToCloudQueries, 'edge-to-cloud.sql');
       await fs.writeFile(`${baseOutputPath}/edge-to-cloud/missing-records.sql`, sqlContent, 'utf8');
-      
+
       // JSON raporu da oluştur
       const jsonReport = {
         timestamp: new Date().toISOString(),
@@ -740,7 +782,7 @@ export class DataComparator {
       };
       await fs.writeFile(`${baseOutputPath}/edge-to-cloud/report.json`, JSON.stringify(jsonReport, null, 2), 'utf8');
     }
-    
+
     // Genel özet raporu
     const summaryReport = {
       timestamp: new Date().toISOString(),
@@ -758,9 +800,9 @@ export class DataComparator {
       },
       details: insertQueries
     };
-    
+
     await fs.writeFile(`${baseOutputPath}/summary-report.json`, JSON.stringify(summaryReport, null, 2), 'utf8');
-    
+
     return {
       cloudToEdgeQueries: cloudToEdgeQueries.length,
       edgeToCloudQueries: edgeToCloudQueries.length,

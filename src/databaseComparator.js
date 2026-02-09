@@ -18,7 +18,7 @@ export class DatabaseComparator {
     // Configurable timeout values with larger defaults for big tables
     const timeoutMs = options.timeout || 120000; // 2 minutes default
     const queryTimeoutMs = options.queryTimeout || 300000; // 5 minutes for queries
-    
+
     const baseConfig = {
       connectionString: url,
       connectionTimeoutMillis: timeoutMs,
@@ -38,7 +38,7 @@ export class DatabaseComparator {
     }
 
     let client = new Client(config);
-    
+
     try {
       await client.connect();
       return client;
@@ -47,13 +47,13 @@ export class DatabaseComparator {
       if (client) {
         await client.end();
       }
-      
+
       // If SSL failed and not explicitly required, try without SSL
       if (!url.includes('sslmode=require') && !url.includes('sslmode=disable')) {
         console.log(chalk.yellow('Trying connection without SSL...'));
         config = { ...baseConfig, ssl: false };
         client = new Client(config);
-        
+
         try {
           await client.connect();
           console.log(chalk.green('Non-SSL connection successful'));
@@ -78,7 +78,7 @@ export class DatabaseComparator {
     // Configurable timeout values with larger defaults for big tables
     const timeoutMs = options.timeout || 120000; // 2 minutes default
     const queryTimeoutMs = options.queryTimeout || 300000; // 5 minutes for queries
-    
+
     // First try with SSL
     let config = {
       connectionString: url,
@@ -100,7 +100,7 @@ export class DatabaseComparator {
     }
 
     let client = new Client(config);
-    
+
     try {
       await client.connect();
       await client.end();
@@ -110,13 +110,13 @@ export class DatabaseComparator {
       if (client) {
         await client.end();
       }
-      
+
       // If SSL failed and not explicitly required, try without SSL
       if (!url.includes('sslmode=require') && !url.includes('sslmode=disable')) {
         console.log('Trying connection without SSL...');
         config.ssl = false;
         client = new Client(config);
-        
+
         try {
           await client.connect();
           await client.end();
@@ -129,7 +129,7 @@ export class DatabaseComparator {
           }
         }
       }
-      
+
       return false;
     }
   }
@@ -140,7 +140,24 @@ export class DatabaseComparator {
   async compareDatabases(sourceUrl, targetUrl, schema = 'public', verbose = false, dumpOptions = {}) {
     let spinner;
     let sourceSchema, targetSchema;
-    
+
+    // Parse table filter - supports both "table" and "schema.table" formats
+    let tableFilter = null;
+    if (dumpOptions.tables && dumpOptions.tables.length > 0) {
+      tableFilter = dumpOptions.tables.map(t => {
+        if (t.includes('.')) {
+          const [tableSchema, tableName] = t.split('.');
+          // If schema matches, use just the table name
+          if (tableSchema === schema) {
+            return tableName;
+          }
+          // If different schema, we'll skip this table for this schema
+          return null;
+        }
+        return t;
+      }).filter(t => t !== null);
+    }
+
     try {
       // Determine cloud source (DB or dump)
       if (dumpOptions.cloudDump) {
@@ -153,9 +170,9 @@ export class DatabaseComparator {
         spinner = ora('Connecting to cloud database...').start();
         this.sourceClient = await this.createClient(sourceUrl, dumpOptions);
         spinner.succeed('Cloud database connection successful');
-        
+
         spinner.start('Getting cloud schema information...');
-        sourceSchema = await this.getSchemaInfo(this.sourceClient, schema);
+        sourceSchema = await this.getSchemaInfo(this.sourceClient, schema, tableFilter);
         spinner.succeed('Cloud schema information retrieved');
       }
 
@@ -170,19 +187,19 @@ export class DatabaseComparator {
         spinner = ora('Connecting to edge database...').start();
         this.targetClient = await this.createClient(targetUrl, dumpOptions);
         spinner.succeed('Edge database connection successful');
-        
+
         spinner.start('Getting edge schema information...');
-        targetSchema = await this.getSchemaInfo(this.targetClient, schema);
+        targetSchema = await this.getSchemaInfo(this.targetClient, schema, tableFilter);
         spinner.succeed('Edge schema information retrieved');
       }
-      
+
       // Perform comparison
       spinner.start('Performing comparison...');
       const comparison = this.compareSchemas(sourceSchema, targetSchema, verbose);
       spinner.succeed('Comparison completed');
-      
+
       return comparison;
-      
+
     } catch (error) {
       spinner.fail('Error occurred');
       throw error;
@@ -199,8 +216,11 @@ export class DatabaseComparator {
 
   /**
    * Get database schema information
+   * @param {object} client - Database client
+   * @param {string} schema - Schema name
+   * @param {string[]|null} tables - Optional array of specific tables to include
    */
-  async getSchemaInfo(client, schema) {
+  async getSchemaInfo(client, schema, tables = null) {
     const schemaInfo = {
       totalTables: 0,
       tableList: [],
@@ -208,26 +228,44 @@ export class DatabaseComparator {
     };
 
     // Get table list
-    const tablesQuery = `
-      SELECT table_name 
-      FROM information_schema.tables 
-      WHERE table_schema = $1 
-      AND table_type = 'BASE TABLE'
-      ORDER BY table_name
-    `;
-    
-    const tablesResult = await client.query(tablesQuery, [schema]);
+    let tablesQuery;
+    let queryParams;
+
+    if (tables && tables.length > 0) {
+      // Filter by specific tables
+      const placeholders = tables.map((_, i) => `$${i + 2}`).join(', ');
+      tablesQuery = `
+        SELECT table_name 
+        FROM information_schema.tables 
+        WHERE table_schema = $1 
+        AND table_type = 'BASE TABLE'
+        AND table_name IN (${placeholders})
+        ORDER BY table_name
+      `;
+      queryParams = [schema, ...tables];
+    } else {
+      tablesQuery = `
+        SELECT table_name 
+        FROM information_schema.tables 
+        WHERE table_schema = $1 
+        AND table_type = 'BASE TABLE'
+        ORDER BY table_name
+      `;
+      queryParams = [schema];
+    }
+
+    const tablesResult = await client.query(tablesQuery, queryParams);
     schemaInfo.totalTables = tablesResult.rows.length;
-    
+
     // Get detailed information for each table
     for (const row of tablesResult.rows) {
       const tableName = row.table_name;
       const tableInfo = await this.getTableInfo(client, tableName, schema);
-      
+
       schemaInfo.tableList.push(tableInfo);
       schemaInfo.tables[tableName] = tableInfo;
     }
-    
+
     return schemaInfo;
   }
 
@@ -258,7 +296,7 @@ export class DatabaseComparator {
       AND table_name = $2
       ORDER BY ordinal_position
     `;
-    
+
     const columnsResult = await client.query(columnsQuery, [schema, tableName]);
     tableInfo.columns = columnsResult.rows.map(col => ({
       name: col.column_name,
@@ -281,7 +319,7 @@ export class DatabaseComparator {
       AND tc.table_name = $2
       ORDER BY kcu.ordinal_position
     `;
-    
+
     const primaryKeysResult = await client.query(primaryKeysQuery, [schema, tableName]);
     tableInfo.primaryKeys = primaryKeysResult.rows.map(row => row.column_name);
 
@@ -301,10 +339,10 @@ export class DatabaseComparator {
       AND tc.table_schema = $1
       AND tc.table_name = $2
     `;
-    
+
     const foreignKeysResult = await client.query(foreignKeysQuery, [schema, tableName]);
     const fkMap = {};
-    
+
     foreignKeysResult.rows.forEach(row => {
       if (!fkMap[row.constraint_name]) {
         fkMap[row.constraint_name] = {
@@ -317,7 +355,7 @@ export class DatabaseComparator {
       fkMap[row.constraint_name].columns.push(row.column_name);
       fkMap[row.constraint_name].referencedColumns.push(row.foreign_column_name);
     });
-    
+
     tableInfo.foreignKeys = Object.values(fkMap);
 
     // Get indexes
@@ -329,7 +367,7 @@ export class DatabaseComparator {
       WHERE schemaname = $1 
       AND tablename = $2
     `;
-    
+
     const indexesResult = await client.query(indexesQuery, [schema, tableName]);
     tableInfo.indexes = indexesResult.rows.map(row => ({
       name: row.indexname,
@@ -347,16 +385,16 @@ export class DatabaseComparator {
     // Extract table names
     const sourceTableNames = sourceSchema.tableList.map(table => typeof table === 'string' ? table : table.name);
     const targetTableNames = targetSchema.tableList.map(table => typeof table === 'string' ? table : table.name);
-    
+
     const sourceTables = new Set(sourceTableNames);
     const targetTables = new Set(targetTableNames);
 
     // Common tables
     const commonTables = sourceTableNames.filter(table => targetTables.has(table));
-    
+
     // Tables only in source
     const onlyInSource = sourceTableNames.filter(table => !targetTables.has(table));
-    
+
     // Tables only in target
     const onlyInTarget = targetTableNames.filter(table => !sourceTables.has(table));
 
@@ -364,16 +402,16 @@ export class DatabaseComparator {
     const tableDifferences = [];
     for (const tableName of commonTables) {
       // Find table information
-      const sourceTable = sourceSchema.tables ? 
-        sourceSchema.tables[tableName] : 
+      const sourceTable = sourceSchema.tables ?
+        sourceSchema.tables[tableName] :
         sourceSchema.tableList.find(t => t.name === tableName);
-      const targetTable = targetSchema.tables ? 
-        targetSchema.tables[tableName] : 
+      const targetTable = targetSchema.tables ?
+        targetSchema.tables[tableName] :
         targetSchema.tableList.find(t => t.name === tableName);
-      
+
       if (sourceTable && targetTable) {
         const differences = this.compareTable(sourceTable, targetTable, tableName);
-        
+
         if (differences.hasDifferences) {
           tableDifferences.push(differences);
         }
@@ -382,7 +420,7 @@ export class DatabaseComparator {
 
     // Generate CREATE SQL for missing tables
     const createTableQueries = [];
-    
+
     // CREATE SQLs for tables in Cloud but not in Edge
     for (const tableName of onlyInSource) {
       const tableInfo = sourceSchema.tableList.find(t => t.name === tableName);
@@ -396,7 +434,7 @@ export class DatabaseComparator {
         });
       }
     }
-    
+
     // CREATE SQLs for tables in Edge but not in Cloud
     for (const tableName of onlyInTarget) {
       const tableInfo = targetSchema.tableList.find(t => t.name === tableName);
@@ -451,7 +489,7 @@ export class DatabaseComparator {
     // Column comparison
     const sourceColumns = sourceTable.columns || [];
     const targetColumns = targetTable.columns || [];
-    
+
     const sourceColMap = new Map(sourceColumns.map(col => [col.name, col]));
     const targetColMap = new Map(targetColumns.map(col => [col.name, col]));
 
@@ -488,7 +526,7 @@ export class DatabaseComparator {
           });
           differences.hasDifferences = true;
         }
-        
+
         if (sourceCol.nullable !== targetCol.nullable) {
           differences.columnDifferences.push({
             columnName: colName,
@@ -502,7 +540,7 @@ export class DatabaseComparator {
     // Primary key comparison
     const sourcePKs = (sourceTable.primaryKeys || []).sort();
     const targetPKs = (targetTable.primaryKeys || []).sort();
-    
+
     if (JSON.stringify(sourcePKs) !== JSON.stringify(targetPKs)) {
       differences.constraintDifferences.push({
         constraintName: 'PRIMARY KEY',
@@ -514,7 +552,7 @@ export class DatabaseComparator {
     // Foreign key comparison
     const sourceFKs = (sourceTable.foreignKeys || []).map(fk => fk.name).sort();
     const targetFKs = (targetTable.foreignKeys || []).map(fk => fk.name).sort();
-    
+
     if (JSON.stringify(sourceFKs) !== JSON.stringify(targetFKs)) {
       differences.constraintDifferences.push({
         constraintName: 'FOREIGN KEYS',
@@ -526,7 +564,7 @@ export class DatabaseComparator {
     // Index comparison
     const sourceIndexes = (sourceTable.indexes || []).map(idx => idx.name).sort();
     const targetIndexes = (targetTable.indexes || []).map(idx => idx.name).sort();
-    
+
     if (JSON.stringify(sourceIndexes) !== JSON.stringify(targetIndexes)) {
       differences.indexDifferences.push({
         indexName: 'ALL INDEXES',
@@ -564,35 +602,35 @@ export class DatabaseComparator {
     const tableName = tableInfo.name;
     let sql = `-- ${queryType} - Create ${tableName} table\n`;
     sql += `CREATE TABLE "${tableName}" (\n`;
-    
+
     // Add columns
     const columnDefinitions = [];
     for (const column of tableInfo.columns) {
       let columnDef = `    "${column.name}" ${column.dataType}`;
-      
+
       // NOT NULL check
       if (!column.nullable) {
         columnDef += ' NOT NULL';
       }
-      
+
       // DEFAULT value
       if (column.defaultValue && column.defaultValue !== 'NULL') {
         columnDef += ` DEFAULT ${column.defaultValue}`;
       }
-      
+
       columnDefinitions.push(columnDef);
     }
-    
+
     sql += columnDefinitions.join(',\n');
     sql += '\n);\n\n';
-    
+
     // Add primary key constraint
     if (tableInfo.primaryKeys && tableInfo.primaryKeys.length > 0) {
       const pkColumns = tableInfo.primaryKeys.map(pk => `"${pk}"`).join(', ');
       sql += `-- Primary key constraint\n`;
       sql += `ALTER TABLE "${tableName}" ADD CONSTRAINT "${tableName}_pkey" PRIMARY KEY (${pkColumns});\n\n`;
     }
-    
+
     // Add foreign key constraints
     if (tableInfo.foreignKeys && tableInfo.foreignKeys.length > 0) {
       sql += `-- Foreign key constraints\n`;
@@ -604,7 +642,7 @@ export class DatabaseComparator {
       }
       sql += '\n';
     }
-    
+
     // Add indexes
     if (tableInfo.indexes && tableInfo.indexes.length > 0) {
       sql += `-- Indexes\n`;
@@ -615,7 +653,7 @@ export class DatabaseComparator {
       }
       sql += '\n';
     }
-    
+
     return sql;
   }
 
@@ -625,30 +663,30 @@ export class DatabaseComparator {
   async generateOrganizedSchemaOutput(createTableQueries, baseOutputPath = process.env.OUTPUT_DIR || 'output') {
     // Create main output directory
     await fs.mkdir(baseOutputPath, { recursive: true });
-    
+
     // Create subdirectories
     const cloudToEdgePath = `${baseOutputPath}/cloud-to-edge`;
     const edgeToCloudPath = `${baseOutputPath}/edge-to-cloud`;
-    
+
     await fs.mkdir(cloudToEdgePath, { recursive: true });
     await fs.mkdir(edgeToCloudPath, { recursive: true });
-    
+
     // Cloud → Edge SQLs (tables missing in Edge)
     const cloudToEdgeQueries = createTableQueries.filter(q => q.type === 'CREATE_IN_EDGE');
     const edgeToCloudQueries = createTableQueries.filter(q => q.type === 'CREATE_IN_CLOUD');
-    
+
     // Cloud → Edge SQL file
     if (cloudToEdgeQueries.length > 0) {
       let sql = `-- Auto-generated CREATE TABLE SQLs\n`;
       sql += `-- Tables missing in Edge database\n`;
       sql += `-- Generated at: ${new Date().toISOString()}\n\n`;
-      
+
       for (const query of cloudToEdgeQueries) {
         sql += query.sql;
       }
-      
+
       await fs.writeFile(`${cloudToEdgePath}/missing-tables.sql`, sql, 'utf8');
-      
+
       // Report file
       const report = {
         timestamp: new Date().toISOString(),
@@ -659,22 +697,22 @@ export class DatabaseComparator {
           description: q.description
         }))
       };
-      
+
       await fs.writeFile(`${cloudToEdgePath}/report.json`, JSON.stringify(report, null, 2), 'utf8');
     }
-    
+
     // Edge → Cloud SQL file
     if (edgeToCloudQueries.length > 0) {
       let sql = `-- Auto-generated CREATE TABLE SQLs\n`;
       sql += `-- Tables missing in Cloud database\n`;
       sql += `-- Generated at: ${new Date().toISOString()}\n\n`;
-      
+
       for (const query of edgeToCloudQueries) {
         sql += query.sql;
       }
-      
+
       await fs.writeFile(`${edgeToCloudPath}/missing-tables.sql`, sql, 'utf8');
-      
+
       // Report file
       const report = {
         timestamp: new Date().toISOString(),
@@ -685,10 +723,10 @@ export class DatabaseComparator {
           description: q.description
         }))
       };
-      
+
       await fs.writeFile(`${edgeToCloudPath}/report.json`, JSON.stringify(report, null, 2), 'utf8');
     }
-    
+
     // Summary report
     const summaryReport = {
       timestamp: new Date().toISOString(),
@@ -702,9 +740,9 @@ export class DatabaseComparator {
         edgeToCloud: edgeToCloudQueries.map(q => q.tableName)
       }
     };
-    
+
     await fs.writeFile(`${baseOutputPath}/schema-summary-report.json`, JSON.stringify(summaryReport, null, 2), 'utf8');
-    
+
     return {
       cloudToEdgeQueries: cloudToEdgeQueries.length,
       edgeToCloudQueries: edgeToCloudQueries.length,
@@ -720,12 +758,12 @@ export class DatabaseComparator {
       cloud: { success: 0, failed: 0, errors: [] },
       edge: { success: 0, failed: 0, errors: [] }
     };
-    
+
     // Tables to be created in Edge (from Cloud)
     const edgeQueries = createTableQueries.filter(q => q.type === 'CREATE_IN_EDGE');
     if (edgeQueries.length > 0 && edgeUrl) {
       console.log(chalk.blue('🏢 Creating tables in Edge database...'));
-      
+
       for (const query of edgeQueries) {
         try {
           if (options.dryRun) {
@@ -736,7 +774,7 @@ export class DatabaseComparator {
             const edgeClient = await this.createClient(edgeUrl, options);
             await edgeClient.query(query.sql);
             await edgeClient.end();
-            
+
             console.log(chalk.green(`✅ ${query.tableName} table created in Edge`));
             results.edge.success++;
           }
@@ -747,12 +785,12 @@ export class DatabaseComparator {
         }
       }
     }
-    
+
     // Tables to be created in Cloud (from Edge)
     const cloudQueries = createTableQueries.filter(q => q.type === 'CREATE_IN_CLOUD');
     if (cloudQueries.length > 0 && cloudUrl) {
       console.log(chalk.blue('☁️ Creating tables in Cloud database...'));
-      
+
       for (const query of cloudQueries) {
         try {
           if (options.dryRun) {
@@ -763,7 +801,7 @@ export class DatabaseComparator {
             const cloudClient = await this.createClient(cloudUrl, options);
             await cloudClient.query(query.sql);
             await cloudClient.end();
-            
+
             console.log(chalk.green(`✅ ${query.tableName} table created in Cloud`));
             results.cloud.success++;
           }
@@ -774,7 +812,7 @@ export class DatabaseComparator {
         }
       }
     }
-    
+
     return results;
   }
 } 
